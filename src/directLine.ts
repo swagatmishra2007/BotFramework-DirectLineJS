@@ -369,7 +369,8 @@ export interface DirectLineOptions {
     pollingInterval?: number,
     streamUrl?: string,
     // Attached to all requests to identify requesting agent.
-    botAgent?: string
+    botAgent?: string,
+    fallback? : boolean
 }
 
 export interface Services {
@@ -468,6 +469,7 @@ export class DirectLine implements IBotConnection {
     private _userAgent: string;
     public referenceGrammarId: string;
     private botIdHeader: string;
+    private fallback: boolean;
 
     private pollingInterval: number = 1000; //ms
 
@@ -498,6 +500,10 @@ export class DirectLine implements IBotConnection {
             }
         }
 
+        if(options.fallback) {
+            this.fallback = options.fallback;
+        }
+
         this._botAgent = this.getBotAgent(options.botAgent);
 
         this.services = makeServices(options);
@@ -519,7 +525,7 @@ export class DirectLine implements IBotConnection {
         );
 
         this.activity$ = (this.webSocket
-            ? this.webSocketActivity$()
+            ? this.webSocketActivityCombined$()
             : this.pollingGetActivity$()
         ).share();
     }
@@ -883,10 +889,94 @@ export class DirectLine implements IBotConnection {
             .flatMap(activityGroup => this.observableFromActivityGroup(activityGroup)));
     }
 
+    private pollingGetActivity1$() {
+        const poller$: Observable<AjaxResponse> = Observable.create((subscriber: Subscriber<any>) => {
+            // A BehaviorSubject to trigger polling. Since it is a BehaviorSubject
+            // the first event is produced immediately.
+            const trigger$ = new BehaviorSubject<any>({});
+
+            // TODO: remove Date.now, use reactive interval to space out every request
+
+            trigger$.subscribe(() => {
+                if (this.connectionStatus$.getValue() === ConnectionStatus.Online) {
+                    const startTimestamp = Date.now();
+
+                    this.services.ajax({
+                        headers: {
+                            Accept: 'application/json',
+                            ...this.commonHeaders()
+                        },
+                        method: 'GET',
+                        url: `${ this.domain }/conversations/${ this.conversationId }/activities?watermark=${ this.watermark }`,
+                        timeout
+                    }).subscribe(
+                        (result: AjaxResponse) => {
+                            subscriber.next(result);
+                            setTimeout(() => trigger$.next(null), Math.max(0, this.pollingInterval - Date.now() + startTimestamp));
+                        },
+                        (error: any) => {
+                            switch (error.status) {
+                                case 403:
+                                    this.connectionStatus$.next(ConnectionStatus.ExpiredToken);
+                                    setTimeout(() => trigger$.next(null), this.pollingInterval);
+                                    break;
+
+                                case 404:
+                                    this.connectionStatus$.next(ConnectionStatus.Ended);
+                                    break;
+
+                                default:
+                                    // propagate the error
+                                    subscriber.error(error);
+                                    break;
+                            }
+                        }
+                    );
+                }
+            });
+        });
+
+        return this.checkConnection()
+        .flatMap(_ => poller$
+            .catch(() => Observable.empty<AjaxResponse>())
+            .map(ajaxResponse => ajaxResponse.response as ActivityGroup));
+    }
+
     private observableFromActivityGroup(activityGroup: ActivityGroup) {
         if (activityGroup.watermark)
             this.watermark = activityGroup.watermark;
         return Observable.from(activityGroup.activities, this.services.scheduler);
+    }
+
+    private webSocketActivity1$(): Observable<Activity> {
+        return this.checkConnection()
+        .flatMap(_ =>
+            this.observableWebSocket<ActivityGroup>()
+            .flatMap(activityGroup => this.observableFromActivityGroup(activityGroup))
+            .catch(err => {
+                console.log(this.hasSucceededOnce);
+                if(!this.hasSucceededOnce) {
+                    return this.pollingGetActivity$()
+                }
+                return Observable.throw(err, this.services.scheduler);
+            })
+        );
+    }
+
+    private webSocketActivityCombined$(): Observable<Activity> {
+        return this.checkConnection()
+        .flatMap(_ =>
+            this.observableWebSocket<ActivityGroup>()
+            .catch(err => {
+                console.log(this.hasSucceededOnce);
+                if(!this.hasSucceededOnce) {
+                    return this.pollingGetActivity1$()
+                }
+                return Observable.throw(err, this.services.scheduler);
+            })
+            .retryWhen(error$ => error$.delay(this.getRetryDelay(), this.services.scheduler).mergeMap(error => this.reconnectToConversation()))
+            .flatMap(activityGroup => this.observableFromActivityGroup(activityGroup))
+        );
     }
 
     private webSocketActivity$(): Observable<Activity> {
@@ -906,6 +996,7 @@ export class DirectLine implements IBotConnection {
         return Math.floor(3000 + this.services.random() * 12000);
     }
 
+    private hasSucceededOnce: boolean;
     // Originally we used Observable.webSocket, but it's fairly opinionated and I ended up writing
     // a lot of code to work around their implemention details. Since WebChat is meant to be a reference
     // implementation, I decided roll the below, where the logic is more purposeful. - @billba
@@ -917,6 +1008,8 @@ export class DirectLine implements IBotConnection {
 
             ws.onopen = open => {
                 konsole.log("WebSocket open", open);
+                this.hasSucceededOnce = true;
+                console.log("on open" + this.hasSucceededOnce)
                 // Chrome is pretty bad at noticing when a WebSocket connection is broken.
                 // If we periodically ping the server with empty messages, it helps Chrome
                 // realize when connection breaks, and close the socket. We then throw an
@@ -937,6 +1030,7 @@ export class DirectLine implements IBotConnection {
             }
 
             ws.onmessage = message => message.data && subscriber.next(JSON.parse(message.data));
+
 
             // This is the 'unsubscribe' method, which is called when this observable is disposed.
             // When the WebSocket closes itself, we throw an error, and this function is eventually called.
